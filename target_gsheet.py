@@ -36,10 +36,15 @@ logger = singer.get_logger()
 
 SCOPES = 'https://www.googleapis.com/auth/spreadsheets'
 CLIENT_SECRET_FILE = 'client_secret.json'
+CREDENTIAL_FILE = 'sheets.googleapis.com-singer-target.json'
 APPLICATION_NAME = 'Singer Sheets Target'
 
+# Options
+INSERT_OPTION_APPEND = 'append'
+INSERT_OPTION_REPLACE = 'replace'
 
-def get_credentials():
+
+def get_credentials(config):
     """Gets valid user credentials from storage.
 
     If nothing has been stored, or if the stored credentials are invalid,
@@ -48,18 +53,15 @@ def get_credentials():
     Returns:
         Credentials, the obtained credential.
     """
-    home_dir = os.path.expanduser('~')
-    credential_dir = os.path.join(home_dir, '.credentials')
-    if not os.path.exists(credential_dir):
-        os.makedirs(credential_dir)
-    credential_path = os.path.join(credential_dir,
-                                   'sheets.googleapis.com-singer-target.json')
+    client_secret = config.get('clientSecret', CLIENT_SECRET_FILE)
+    credential_path = config.get('creds', CREDENTIAL_FILE)
+    application_name = config.get('applicationName', APPLICATION_NAME)
 
     store = Storage(credential_path)
     credentials = store.get()
     if not credentials or credentials.invalid:
-        flow = client.flow_from_clientsecrets(CLIENT_SECRET_FILE, SCOPES)
-        flow.user_agent = APPLICATION_NAME
+        flow = client.flow_from_clientsecrets(client_secret, SCOPES)
+        flow.user_agent = application_name
         if flags:
             credentials = tools.run_flow(flow, store, flags)
         else: # Needed only for compatibility with Python 2.6
@@ -74,7 +76,7 @@ def emit_state(state):
         logger.debug('Emitting state {}'.format(line))
         sys.stdout.write("{}\n".format(line))
         sys.stdout.flush()
-        
+
 def get_spreadsheet(service, spreadsheet_id):
     return service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
 
@@ -102,13 +104,22 @@ def add_sheet(service, spreadsheet_id, title):
         }).execute()
 
 
-def append_to_sheet(service, spreadsheet_id, range, values):
+def append_to_sheet(service, spreadsheet_id, range, values, insert_option=None):
+    insert_option = insert_option or 'insert'
     return service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=range,
         valueInputOption='USER_ENTERED',
-        body={'values': [values]}).execute()
-    
+        body={'values': values}).execute()
+
+
+def clear_sheet(service, spreadsheet_id, range):
+    return service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=range,
+        body={}).execute()
+
+
 def flatten(d, parent_key='', sep='__'):
     items = []
     for k, v in d.items():
@@ -119,13 +130,40 @@ def flatten(d, parent_key='', sep='__'):
             items.append((new_key, str(v) if type(v) is list else v))
     return dict(items)
 
-def persist_lines(service, spreadsheet, lines):
+
+def batch_lines(batch_size, batches, msg):
+    def inner(func):
+        @functools.wraps(func)
+        def wrapper(line):
+            if msg.stream not in batches:
+                batches[msg.stream] = []
+            if line:
+                batches[msg.stream].append(line)
+            if len(batches[msg.stream]) >= batch_size:
+                func(batches[msg.stream])
+                batches[msg.stream] = []
+        return wrapper
+    return inner
+
+
+def persist_lines(service, spreadsheet, lines, config):
+    batch_size = config.get('batchSize', 1)
+    insert_option = config.get('insertOption', INSERT_OPTION_APPEND)
+    sheet_titles = {title.get('stream'): title.get('title')
+                    for title in config.get('sheetTitles', []) if title.get('stream')}
+
     state = None
     schemas = {}
     key_properties = {}
 
     headers_by_stream = {}
-    
+
+    cleared_sheets = []
+
+    batches = {}
+
+    append_send = functools.partial(append_to_sheet, service, spreadsheet['spreadsheetId'], insert_option=insert_option)
+
     for line in lines:
         try:
             msg = singer.parse_message(line)
@@ -140,14 +178,15 @@ def persist_lines(service, spreadsheet, lines):
             schema = schemas[msg.stream]
             validate(msg.record, schema)
             flattened_record = flatten(msg.record)
-            
-            matching_sheet = [s for s in spreadsheet['sheets'] if s['properties']['title'] == msg.stream]
+
+            sheet_title = sheet_titles.get(msg.stream) or msg.stream
+            matching_sheet = [s for s in spreadsheet['sheets'] if s['properties']['title'] == sheet_title]
             new_sheet_needed = len(matching_sheet) == 0
-            range_name = "{}!A1:ZZZ".format(msg.stream)
-            append = functools.partial(append_to_sheet, service, spreadsheet['spreadsheetId'], range_name)
+            range_name = "{}!A1:ZZZ".format(sheet_title)
+            append = batch_lines(batch_size, batches, msg)(functools.partial(append_send, range_name))
 
             if new_sheet_needed:
-                add_sheet(service, spreadsheet['spreadsheetId'], msg.stream)
+                add_sheet(service, spreadsheet['spreadsheetId'], sheet_title)
                 spreadsheet = get_spreadsheet(service, spreadsheet['spreadsheetId']) # refresh this for future iterations
                 headers_by_stream[msg.stream] = list(flattened_record.keys())
                 append(headers_by_stream[msg.stream])
@@ -160,6 +199,10 @@ def persist_lines(service, spreadsheet, lines):
                     headers_by_stream[msg.stream] = list(flattened_record.keys())
                     append(headers_by_stream[msg.stream])
 
+            if insert_option == INSERT_OPTION_REPLACE and sheet_title not in cleared_sheets and not new_sheet_needed:
+                clear_sheet(service, spreadsheet['spreadsheetId'], range_name)
+                cleared_sheets.append(sheet_title)
+
             result = append([flattened_record.get(x, None) for x in headers_by_stream[msg.stream]]) # order by actual headers found in sheet
 
             state = None
@@ -171,6 +214,12 @@ def persist_lines(service, spreadsheet, lines):
             key_properties[msg.stream] = msg.key_properties
         else:
             raise Exception("Unrecognized message {}".format(msg))
+    # Load remaining in batch
+    for stream, batch in batches.items():
+        if batch:
+            sheet_title = sheet_titles.get(stream) or stream
+            range_name = "{}!A1:ZZZ".format(sheet_title)
+            append_send(range_name, batch)
 
     return state
 
@@ -193,18 +242,18 @@ def collect():
     except:
         logger.debug('Collection request failed')
 
-        
+
 def main():
     with open(flags.config) as input:
         config = json.load(input)
-        
+
     if not config.get('disable_collection', False):
         logger.info('Sending version information to stitchdata.com. ' +
                     'To disable sending anonymous usage data, set ' +
                     'the config parameter "disable_collection" to true')
         threading.Thread(target=collect).start()
 
-    credentials = get_credentials()
+    credentials = get_credentials(config)
     http = credentials.authorize(httplib2.Http())
     discoveryUrl = ('https://sheets.googleapis.com/$discovery/rest?'
                     'version=v4')
@@ -215,7 +264,7 @@ def main():
 
     input = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
     state = None
-    state = persist_lines(service, spreadsheet, input)
+    state = persist_lines(service, spreadsheet, input, config)
     emit_state(state)
     logger.debug("Exiting normally")
 
