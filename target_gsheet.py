@@ -54,8 +54,10 @@ def get_credentials(config):
     application_name = config.get("applicationName", APPLICATION_NAME)
 
     if client_secret_string := config.get("clientSecret", CLIENT_SECRET_FILE):
-        client_string_json = client.Credentials.to_json(client_secret_string)
-        return client.Credentials.new_from_json(client_string_json)
+        logging.info("Using client secret string from config")
+        client_secret_dict = json.loads(client_secret_string)
+        client_secret_json = client.Credentials.to_json(client_secret_dict)
+        return client.Credentials.new_from_json(client_secret_json)
 
     store = Storage(credential_path)
     credentials = store.get()
