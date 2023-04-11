@@ -147,8 +147,10 @@ def batch_lines(batch_size, batches, msg):
 
 
 def persist_lines(service, spreadsheet, lines, config):
-    batch_size = config.get('batchSize', 1)
+    batch_size = config.get('batchSize', 1000)
+    logger.info(f"batch size is {batch_size}")
     insert_option = config.get('insertOption', INSERT_OPTION_APPEND)
+    logger.info(f"insert options is {insert_option}")
     sheet_titles = {title.get('stream'): title.get('title')
                     for title in config.get('sheetTitles', []) if title.get('stream')}
 
