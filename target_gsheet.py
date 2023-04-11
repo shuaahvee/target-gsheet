@@ -49,6 +49,7 @@ def get_credentials(config):
     Returns:
         Credentials, the obtained credential.
     """
+    logging.info("getting credentials")
     client_secret = config.get("clientSecret", CLIENT_SECRET_FILE)
     credential_path = config.get("creds", CREDENTIAL_FILE)
     application_name = config.get("applicationName", APPLICATION_NAME)
